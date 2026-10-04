@@ -671,6 +671,40 @@ function seed() {
   reassignAssignment(aAss.id, { target_id: get(`SELECT id FROM assignments WHERE match_id=? AND role='chief' AND status='assigned'`, mB3).id, reason: '孙裁判临时请假，末轮主裁对调', operator: '裁判长' })
 
   recomputeMedals()
+
+  // —— 演示：赛事申诉复核（覆盖三种对象 + 三种状态，全量留痕）——
+  // 1) 待受理：飞鹰学院对篮球首场比分申诉（该场 78:70 雷霆胜，飞鹰称计时有误）
+  const appealMatch = get(`SELECT m.id FROM matches m
+    JOIN teams ta ON ta.id=m.team_a JOIN teams tb ON tb.id=m.team_b
+    WHERE m.sport_id=? AND m.stage='循环' AND m.score_a=78 AND m.score_b=70
+      AND ta.name='雷霆队' AND tb.name='飞鹰队'`, spBasket)
+  const flyUnit = unitId['飞鹰学院']
+  if (appealMatch) {
+    submitAppeal({
+      target_type: 'match', target_id: appealMatch.id, unit_id: flyUnit,
+      reason: '末节最后 2.4 秒进攻被误判超时，请求回看录像复核比分', contact: '飞鹰领队',
+      evidence: '看台录像 2 段、技术台记录表照片'
+    })
+  }
+  // 2) 复核中：飞鹰学院对田径 100 米周楠（10.88s 亚军）成绩申诉
+  const appealEntry = get(`SELECT e.id FROM entries e JOIN athletes a ON a.id=e.athlete_id WHERE a.name='周楠' AND e.sport_id=?`, sp100)
+  if (appealEntry) {
+    const r = submitAppeal({
+      target_type: 'track', target_id: appealEntry.id, unit_id: flyUnit,
+      reason: '起跑反应计时疑似偏差，申请复核计时设备记录', contact: '田径教练'
+    })
+    acceptAppeal(r.id, '仲裁委员会')
+  }
+  // 3) 已驳回：星河学院对篮球冠军雷霆队的参赛资格申诉
+  const champReg = get(`SELECT id FROM registrations WHERE sport_id=? AND kind='team' AND name='雷霆队' ORDER BY id LIMIT 1`, spBasket)
+  if (champReg) {
+    const r = submitAppeal({
+      target_type: 'eligibility', target_id: champReg.id, unit_id: unitId['星河学院'],
+      reason: '质疑雷霆队 7 号球员学籍归属，请复核报名资格'
+    })
+    acceptAppeal(r.id, '仲裁委员会')
+    closeAppeal(r.id, 'reject', '经核查学籍证明与报名材料一致，资格有效，申诉驳回', '仲裁委员会')
+  }
 }
 /* ================= 积分与奖牌 ================= */
 function rebuildStandings(sportId) {
@@ -1360,6 +1394,343 @@ function recomputeTrackRanks(sportId) {
   run(`UPDATE entries SET rank=NULL WHERE sport_id=? AND mark IS NULL`, sportId)
 }
 
+/* ================= 赛事申诉复核 ================= */
+// 申诉单工作流：pending(待受理) → reviewing(复核中) → upheld(改判) / rejected(驳回)；
+// pending/reviewing 可由申诉单位撤案(withdrawn)。全部状态迁移与改判级联包裹在单事务中，幂等可重放。
+const APPEAL_OPEN = new Set(['pending', 'reviewing'])
+function nextAppealCode() {
+  // 申诉单永久保留，按总数顺序编号即可；BEGIN IMMEDIATE 写锁保证并发不重号
+  const n = get('SELECT COUNT(*) c FROM appeals').c + 1
+  return 'SS-' + String(n).padStart(4, '0')
+}
+function addAppealLog(appealId, action, detail, snapshot, operator = '组委会') {
+  run(`INSERT INTO appeal_logs (appeal_id,action,detail,snapshot,operator) VALUES (?,?,?,?,?)`,
+    appealId, action, detail ?? null, snapshot ? JSON.stringify(snapshot) : null, operator)
+}
+// 奖牌 / 积分快照：改判前后各取一份，差异写入审计，回答"谁的奖牌积分发生了什么变化"
+function medalSnapshot() {
+  return Object.fromEntries(all('SELECT unit_id, gold, silver, bronze FROM medals')
+    .map(r => [r.unit_id, { gold: r.gold, silver: r.silver, bronze: r.bronze }]))
+}
+function standingsSnapshot(sportId) {
+  return Object.fromEntries(all('SELECT team_id, points, rank FROM standings WHERE sport_id=?', sportId)
+    .map(r => [r.team_id, { points: r.points, rank: r.rank }]))
+}
+function diffMedalMap(before, after) {
+  const out = []
+  new Set([...Object.keys(before), ...Object.keys(after)]).forEach(k => {
+    const b = before[k] || { gold: 0, silver: 0, bronze: 0 }
+    const a = after[k] || { gold: 0, silver: 0, bronze: 0 }
+    if (a.gold !== b.gold || a.silver !== b.silver || a.bronze !== b.bronze) {
+      out.push({ unit_id: Number(k), gold: a.gold - b.gold, silver: a.silver - b.silver, bronze: a.bronze - b.bronze })
+    }
+  })
+  return out
+}
+function diffStandingsMap(sportId, before) {
+  const after = standingsSnapshot(sportId)
+  const out = []
+  new Set([...Object.keys(before), ...Object.keys(after)]).forEach(k => {
+    const b = before[k] || { points: 0, rank: 0 }
+    const a = after[k] || { points: 0, rank: 0 }
+    if (a.points !== b.points || a.rank !== b.rank) {
+      out.push({ team_id: Number(k), name: get('SELECT name FROM teams WHERE id=?', Number(k))?.name || '',
+        points_from: b.points, points_to: a.points, rank_from: b.rank, rank_to: a.rank })
+    }
+  })
+  return out
+}
+const scoreText = (sa, sb, ta, tb) => `${sa}:${sb}` + (ta != null ? `（决胜 ${ta}:${tb}）` : '')
+
+// 已完赛场次因申诉回退重赛：清比分/胜方回到待赛；执法名单作为原班人马保留（void 场次需重新排班）
+function resetMatchForReplay(m, teamA, teamB, note, operator) {
+  const wasVoid = m.status === 'void'
+  run(`UPDATE matches SET status='scheduled', team_a=?, team_b=?, score_a=NULL, score_b=NULL,
+      tb_a=NULL, tb_b=NULL, winner=NULL, note=? WHERE id=?`, teamA, teamB, note, m.id)
+  const fresh = get('SELECT * FROM matches WHERE id=?', m.id)
+  if (wasVoid) addLog('match_change', m.id, null, `${matchTitle(fresh)} 因申诉改判恢复待赛并替换对阵，重新联动排班`, note, operator)
+  else addLog('match_change', m.id, null, `${matchTitle(fresh)} 因申诉改判回退待赛重赛，原执法名单保留`, note, operator)
+  return fresh
+}
+// 决赛/季军战按改判后的半决赛赛果同步：对阵变化或已完赛需重赛 → 回退待赛；不变则保留
+function syncPlacementForReplay(sportId, stage, teams, orderNo, timeLabel, note, operator) {
+  const m = get(`SELECT * FROM matches WHERE sport_id=? AND stage=?`, sportId, stage)
+  const [a, b] = teams.length === 2 ? teams : [null, null]
+  if (!a || !b) {
+    if (m && m.status !== 'void') { voidMatch(m, note, operator); return { resetted: true, match: m } }
+    return { resetted: false, match: m }
+  }
+  if (!m) {
+    const id = createPlacementMatch(sportId, stage, a, b, orderNo, timeLabel, 'scheduled', null, null)
+    const fresh = get('SELECT * FROM matches WHERE id=?', id)
+    addLog('schedule_added', id, null, `${matchTitle(fresh)} 因申诉改判级联生成`, note, operator)
+    autoCrewForNewMatches([id], operator)
+    return { resetted: true, match: fresh }
+  }
+  if (m.status === 'scheduled' && m.team_a === a && m.team_b === b) return { resetted: false, match: m }
+  const wasVoid = m.status === 'void'
+  const fresh = resetMatchForReplay(m, a, b, note, operator)
+  if (wasVoid) autoCrewForNewMatches([m.id], operator)
+  return { resetted: true, match: fresh }
+}
+
+// 小组赛改判后按全新积分排名重排半决赛：
+// 待赛半决赛直接替换队伍（执法名单继续有效）；已赛/已取消半决赛回退待赛重赛；随后决赛/季军作废待重赛编排
+function reseatSemisFromGroups(sportId, note, operator) {
+  const semis = all(`SELECT * FROM matches WHERE sport_id=? AND stage='半决赛' ORDER BY order_no,id`, sportId)
+  const replays = []
+  if (!semis.length) return { reseated: 0, replays, cascade: 0 }
+  const rankIds = g => {
+    const ids = all(`SELECT DISTINCT team_a id FROM matches WHERE sport_id=? AND group_name=? AND team_a IS NOT NULL
+                     UNION SELECT DISTINCT team_b FROM matches WHERE sport_id=? AND group_name=? AND team_b IS NOT NULL`,
+      sportId, g, sportId, g).map(r => r.id).filter(id => get('SELECT status FROM teams WHERE id=?', id)?.status === 'approved')
+    return ids.map(id => ({ id, rank: get('SELECT rank r FROM standings WHERE sport_id=? AND team_id=?', sportId, id)?.r ?? 999 }))
+      .sort((x, y) => x.rank - y.rank).map(r => r.id)
+  }
+  const A = rankIds('A组'), B = rankIds('B组')
+  if (A.length < 2 || B.length < 2) throw new Error('小组改判后有效出线队伍不足 2 支，无法重新编排半决赛')
+  const desired = [[A[0], B[1]], [B[0], A[1]]]
+  const needCrew = []
+  semis.forEach((m, i) => {
+    const [da, db] = desired[i]
+    if (m.status !== 'void' && m.team_a === da && m.team_b === db) return
+    const wasVoid = m.status === 'void'
+    const fresh = resetMatchForReplay(m, da, db, note, operator)
+    replays.push({ match_id: m.id, stage: '半决赛', title: matchTitle(fresh) })
+    if (wasVoid) needCrew.push(m.id)
+  })
+  let cascade = 0
+  if (replays.length) {
+    if (needCrew.length) autoCrewForNewMatches(needCrew, operator)
+    // 半决赛不再全部 settled → reconcileKnockout 统一作废决赛/季军（解除在派裁判并留痕）
+    const r = reconcileKnockout(sportId, note, operator)
+    cascade = r.created + r.adjusted
+  }
+  return { reseated: replays.length, replays, cascade }
+}
+
+// 半决赛改判后：以新的胜/负方同步决赛与季军战（变化的回退待赛重赛）
+function reconcilePlacementForReplay(sportId, note, operator) {
+  const semis = all(`SELECT * FROM matches WHERE sport_id=? AND stage='半决赛' ORDER BY order_no,id`, sportId)
+  if (semis.length !== 2) return { replays: [], cascade: 0 }
+  const finalists = semis.map(canonicalSemiWinner)
+  const losers = semis.map(canonicalSemiLoser)
+  if (finalists.some(x => x == null)) throw new Error('改判后存在无有效胜方的半决赛，无法同步决赛对阵')
+  const replays = []
+  const f = syncPlacementForReplay(sportId, '决赛', finalists, 101, '16:00', note, operator)
+  if (f.resetted && f.match) replays.push({ match_id: f.match.id, stage: '决赛', title: matchTitle(f.match) })
+  const t = syncPlacementForReplay(sportId, '季军', losers.every(x => x != null) ? losers : [], 102, '15:30', note, operator)
+  if (t.resetted && t.match) replays.push({ match_id: t.match.id, stage: '季军', title: matchTitle(t.match) })
+  return { replays, cascade: replays.length }
+}
+
+function submitAppeal(body) {
+  return withTransaction(() => {
+    const targetType = body.target_type
+    if (!['match', 'track', 'eligibility'].includes(targetType)) throw new Error('申诉对象类型无效')
+    const unitId = Number(body.unit_id)
+    if (!get('SELECT id FROM units WHERE id=?', unitId)) throw new Error('申诉单位不存在')
+    const reason = (body.reason || '').trim()
+    if (!reason) throw new Error('请填写申诉理由')
+    const targetId = Number(body.target_id)
+    if (!Number.isInteger(targetId) || targetId <= 0) throw new Error('请选择申诉对象')
+
+    // 解析并校验申诉对象，确定归属项目
+    let sportId = null, targetDesc = ''
+    if (targetType === 'match') {
+      const m = get('SELECT * FROM matches WHERE id=?', targetId)
+      if (!m) throw new Error('被申诉场次不存在')
+      if (m.status === 'void') throw new Error('该场次成绩已取消，不能申诉')
+      if (m.status !== 'finished') throw new Error('该场次尚未完赛，暂不能申诉')
+      const ua = m.team_a ? get('SELECT unit_id FROM teams WHERE id=?', m.team_a)?.unit_id : null
+      const ub = m.team_b ? get('SELECT unit_id FROM teams WHERE id=?', m.team_b)?.unit_id : null
+      if (unitId !== ua && unitId !== ub) throw new Error('仅对阵参赛单位可对该场比分申诉')
+      sportId = m.sport_id
+      targetDesc = matchTitle(m)
+    } else if (targetType === 'track') {
+      const e = get(`SELECT e.*, a.name aname FROM entries e JOIN athletes a ON a.id=e.athlete_id WHERE e.id=?`, targetId)
+      if (!e) throw new Error('被申诉成绩不存在')
+      if (e.mark == null) throw new Error('该成绩尚未录入，暂不能申诉')
+      sportId = e.sport_id
+      targetDesc = `${get('SELECT name FROM sports WHERE id=?', sportId).name} · ${e.aname} ${e.mark}s（第 ${e.rank} 名）`
+    } else {
+      const reg = get('SELECT * FROM registrations WHERE id=?', targetId)
+      if (!reg) throw new Error('被申诉报名记录不存在')
+      if (reg.status !== 'approved') throw new Error('仅已通过资格审核的对象可被资格申诉')
+      if (reg.unit_id === unitId) throw new Error('不能对本单位自身资格提起申诉（如需退出请走退报流程）')
+      sportId = reg.sport_id
+      targetDesc = `${reg.kind === 'team' ? '队伍' : '运动员'}「${reg.name}」的参赛资格（${get('SELECT name FROM units WHERE id=?', reg.unit_id)?.name}）`
+    }
+
+    // 同单位同一对象存在未结案申诉时拒绝，避免重复立案
+    const dup = get(`SELECT id FROM appeals WHERE target_type=? AND target_id=? AND unit_id=? AND status IN ('pending','reviewing')`,
+      targetType, targetId, unitId)
+    if (dup) throw new Error('该单位已就该对象提交申诉且正在处理中，请勿重复提交')
+
+    const code = nextAppealCode()
+    const r = run(`INSERT INTO appeals (code,target_type,target_id,unit_id,sport_id,reason,contact,evidence,status)
+                   VALUES (?,?,?,?,?,?,?,?, 'pending')`,
+      code, targetType, targetId, unitId, sportId, reason, (body.contact || '').trim() || null, (body.evidence || '').trim() || null)
+    const id = Number(r.lastInsertRowid)
+    const unitName = get('SELECT name FROM units WHERE id=?', unitId).name
+    addAppealLog(id, 'submit', `${unitName} 对 ${targetDesc} 提交异议：${reason}`, null, unitName)
+    return { ok: true, id, code }
+  })
+}
+
+function acceptAppeal(appealId, reviewer = '组委会') {
+  return withTransaction(() => {
+    const a = get('SELECT * FROM appeals WHERE id=?', appealId)
+    if (!a) throw new Error('申诉单不存在')
+    if (a.status === 'reviewing') return { ok: true, idempotent: true }
+    if (a.status !== 'pending') throw new Error('该申诉已结案，不能再受理')
+    const claim = run(`UPDATE appeals SET status='reviewing', accepted_at=datetime('now','localtime'), reviewer=?
+                       WHERE id=? AND status='pending'`, reviewer, appealId)
+    if (!claim.changes) return { ok: true, idempotent: true }
+    addAppealLog(appealId, 'accept', `${reviewer} 受理申诉 ${a.code}，进入复核`, null, reviewer)
+    return { ok: true }
+  })
+}
+
+function closeAppeal(appealId, action, note, operator) {
+  return withTransaction(() => {
+    const a = get('SELECT * FROM appeals WHERE id=?', appealId)
+    if (!a) throw new Error('申诉单不存在')
+    const targetStatus = action === 'reject' ? 'rejected' : 'withdrawn'
+    if (a.status === targetStatus) return { ok: true, idempotent: true }
+    if (!APPEAL_OPEN.has(a.status)) throw new Error('该申诉已结案，不能重复处理')
+    if (action === 'reject' && !(note || '').trim()) throw new Error('驳回申诉必须填写复核意见')
+    const claim = run(`UPDATE appeals SET status=?, review_note=?, reviewed_at=datetime('now','localtime'), reviewer=?
+                       WHERE id=? AND status IN ('pending','reviewing')`,
+      targetStatus, (note || '').trim() || null, operator || '申诉单位', appealId)
+    if (!claim.changes) return { ok: true, idempotent: true }
+    if (action === 'reject') {
+      addAppealLog(appealId, 'reject', `${operator} 驳回申诉 ${a.code}：${(note || '').trim()}`, null, operator)
+    } else {
+      const unitName = get('SELECT name FROM units WHERE id=?', a.unit_id)?.name || '申诉单位'
+      addAppealLog(appealId, 'withdraw', `${unitName} 撤回申诉 ${a.code}${note ? '：' + String(note).trim() : ''}`, null, unitName)
+    }
+    return { ok: true }
+  })
+}
+
+// 复核改判：回写比分/成绩或撤销资格，原子联动积分榜、淘汰赛递补重赛与奖牌榜
+function upholdAppeal(appealId, body) {
+  return withTransaction(() => {
+    const a = get('SELECT * FROM appeals WHERE id=?', appealId)
+    if (!a) throw new Error('申诉单不存在')
+    if (a.status === 'upheld') return { ok: true, idempotent: true, impact: safeParseJson(a.impact) }
+    if (a.status !== 'reviewing') throw new Error('需先受理申诉进入复核，才能作出改判')
+    const reviewer = (body.reviewer || '组委会').trim() || '组委会'
+    const note = (body.note || '').trim()
+    if (!note) throw new Error('复核改判必须填写复核意见')
+
+    const beforeMedals = medalSnapshot()
+    const beforeStandings = a.sport_id ? standingsSnapshot(a.sport_id) : {}
+    const impact = { resolution: null, corrected: [], replays: [], cascade: 0 }
+    let scoreSnap = null
+
+    if (a.target_type === 'match') {
+      const m = get('SELECT * FROM matches WHERE id=?', a.target_id)
+      if (!m) throw new Error('被申诉场次不存在')
+      if (m.status !== 'finished') throw new Error('该场次当前不是已完赛状态，无法回写比分')
+      if (!m.team_a || !m.team_b || !isActiveTeam(m.team_a) || !isActiveTeam(m.team_b)) {
+        throw new Error('对阵中存在失去资格队伍，请改走资格类申诉处理')
+      }
+      const sa = Number(body.score_a), sb = Number(body.score_b)
+      if (!Number.isInteger(sa) || !Number.isInteger(sb) || sa < 0 || sb < 0) throw new Error('改判比分必须为非负整数')
+      let winner = null, ta = null, tb = null
+      if (sa > sb) winner = m.team_a
+      else if (sb > sa) winner = m.team_b
+      else if (KO_STAGES.includes(m.stage)) {
+        ta = body.tb_a === '' || body.tb_a == null ? null : Number(body.tb_a)
+        tb = body.tb_b === '' || body.tb_b == null ? null : Number(body.tb_b)
+        if (!Number.isInteger(ta) || !Number.isInteger(tb) || ta < 0 || tb < 0) throw new Error('淘汰赛平分改判需录入加时/点球决胜比分')
+        if (ta === tb) throw new Error('决胜比分不能再次持平')
+        winner = ta > tb ? m.team_a : m.team_b
+      }
+      if (sa === m.score_a && sb === m.score_b && ta === (m.tb_a ?? null) && tb === (m.tb_b ?? null)) {
+        throw new Error('回写比分与原比分一致，无需改判')
+      }
+      scoreSnap = {
+        match_id: m.id, from: { score_a: m.score_a, score_b: m.score_b, tb_a: m.tb_a, tb_b: m.tb_b },
+        to: { score_a: sa, score_b: sb, tb_a: ta, tb_b: tb }
+      }
+      const changeNote = `申诉改判(${a.code})`
+      run(`UPDATE matches SET score_a=?, score_b=?, tb_a=?, tb_b=?, winner=?, note=? WHERE id=?`, sa, sb, ta, tb, winner, changeNote, m.id)
+      const fresh = get('SELECT * FROM matches WHERE id=?', m.id)
+      addLog('match_change', m.id, null,
+        `${matchTitle(fresh)} 申诉改判：${scoreText(m.score_a, m.score_b, m.tb_a, m.tb_b)} → ${scoreText(sa, sb, ta, tb)}`,
+        `${a.code} ${note}`, reviewer)
+      impact.corrected.push({ match_id: m.id, stage: m.stage, group_name: m.group_name,
+        from: scoreText(m.score_a, m.score_b, m.tb_a, m.tb_b), to: scoreText(sa, sb, ta, tb) })
+
+      const spo = get('SELECT * FROM sports WHERE id=?', m.sport_id)
+      if (spo.format === 'roundrobin' || m.stage === '循环') {
+        rebuildStandings(m.sport_id)
+      } else if (m.group_name) {
+        // 小组赛改判：先重建小组积分，再按新排名重置半决赛、作废后续轮次
+        rebuildStandings(m.sport_id)
+        const r = reseatSemisFromGroups(m.sport_id, `${changeNote}：小组改判后按新排名递补`, reviewer)
+        impact.replays = r.replays
+        impact.replacements = r.reseated
+        impact.cascade = r.cascade
+      } else if (m.stage === '半决赛') {
+        // 半决赛改判：按新胜/负方同步决赛与季军战，变化的回退待赛重赛
+        const r = reconcilePlacementForReplay(m.sport_id, `${changeNote}：半决赛改判后重新确定对阵`, reviewer)
+        impact.replays = r.replays
+        impact.cascade = r.cascade
+      }
+      impact.resolution = 'score_corrected'
+    } else if (a.target_type === 'track') {
+      const e = get(`SELECT * FROM entries WHERE id=?`, a.target_id)
+      if (!e) throw new Error('被申诉成绩不存在')
+      const ath = get('SELECT * FROM athletes WHERE id=?', e.athlete_id)
+      if (ath.status !== 'approved') throw new Error('该运动员已失去资格，请改走资格类申诉处理')
+      const mark = Number(body.mark)
+      if (!Number.isFinite(mark) || mark <= 0) throw new Error('改判成绩必须为大于 0 的有效数字（秒）')
+      if (e.mark != null && Math.abs(e.mark - mark) < 1e-9) throw new Error('回写成绩与原成绩一致，无需改判')
+      scoreSnap = { entry_id: e.id, athlete: ath.name, from: { mark: e.mark, rank: e.rank }, to: { mark } }
+      run('UPDATE entries SET mark=? WHERE id=?', mark, e.id)
+      recomputeTrackRanks(e.sport_id)
+      impact.corrected.push({ entry_id: e.id, athlete: ath.name, from: `${e.mark}s（第${e.rank}名）`, to: `${mark}s` })
+      impact.resolution = 'track_corrected'
+    } else {
+      const reg = get('SELECT * FROM registrations WHERE id=?', a.target_id)
+      if (!reg) throw new Error('被申诉报名记录不存在')
+      if (reg.status !== 'approved') throw new Error('该对象当前不具备有效资格，无需撤销')
+      const revokeNote = `申诉撤销资格(${a.code})：${note}`
+      // 复用资格撤销级联（嵌套并入本事务）：弃权/取消成绩/淘汰赛递补/田径成绩删除
+      const r = withdrawOrRevoke(reg.id, 'revoke', revokeNote, reviewer)
+      Object.assign(impact, r.impact)
+      impact.corrected.push({ registration_id: reg.id, name: reg.name, kind: reg.kind })
+      impact.resolution = 'revoked'
+    }
+
+    recomputeMedals()
+    const medalChanges = diffMedalMap(beforeMedals, medalSnapshot())
+    const standingsChanges = a.sport_id ? diffStandingsMap(a.sport_id, beforeStandings) : []
+    impact.medal_changes = medalChanges
+    impact.standings_changes = standingsChanges
+
+    const claim = run(`UPDATE appeals SET status='upheld', reviewed_at=datetime('now','localtime'), reviewer=?,
+                       review_note=?, resolution=?, impact=? WHERE id=? AND status='reviewing'`,
+      reviewer, note, impact.resolution, JSON.stringify(impact), appealId)
+    if (!claim.changes) {
+      const now = get('SELECT status, impact FROM appeals WHERE id=?', appealId)
+      if (now?.status === 'upheld') return { ok: true, idempotent: true, impact: safeParseJson(now.impact) }
+      throw new Error('该申诉已被其它请求处理')
+    }
+    const detailParts = [`${reviewer} 复核改判 ${a.code}`]
+    impact.corrected.forEach(c => detailParts.push(c.from && c.to ? `回写 ${c.from} → ${c.to}` : `撤销「${c.name}」资格`))
+    if (impact.replays?.length) detailParts.push(`回退重赛/递补 ${impact.replays.length} 场`)
+    if (medalChanges.length) detailParts.push(`奖牌变动 ${medalChanges.length} 个单位`)
+    addAppealLog(appealId, 'uphold', detailParts.join('；'), { score: scoreSnap, impact }, reviewer)
+    return { ok: true, impact }
+  })
+}
+function safeParseJson(s) { try { return s ? JSON.parse(s) : null } catch { return null } }
+
 /* ================= 历史赛程统计修复 ================= */
 // 校正并发审核/重排在历史数据中遗留的失真，让积分榜与奖牌榜回到权威赛果口径：
 // 1) 循环赛重复对阵场次去重（并发重排可能重复插场）：保留最早有效场，多余场解除执法并作废留痕
@@ -1631,6 +2002,57 @@ app.post('/api/maintenance/repair', (req, res) => {
   try { res.json({ ok: true, report: repairHistoricalStats(req.body?.operator || '组委会') }) }
   catch (e) { res.status(400).json({ error: e.message }) }
 })
+
+/* —— 赛事申诉复核：单位提交异议 → 组委会受理/复核改判/驳回，全量留痕 —— */
+const joinAppeal = a => {
+  const unit = get('SELECT id,name,color FROM units WHERE id=?', a.unit_id)
+  const sport = a.sport_id ? get('SELECT id,name,format,category FROM sports WHERE id=?', a.sport_id) : null
+  let target = null
+  if (a.target_type === 'match') {
+    const m = get('SELECT * FROM matches WHERE id=?', a.target_id)
+    target = m ? {
+      ...joinMatch(m),
+      team_a_unit: m.team_a ? get('SELECT unit_id FROM teams WHERE id=?', m.team_a)?.unit_id : null,
+      team_b_unit: m.team_b ? get('SELECT unit_id FROM teams WHERE id=?', m.team_b)?.unit_id : null
+    } : null
+  } else if (a.target_type === 'track') {
+    target = get(`SELECT e.*, a.name aname, a.unit_id athlete_unit, u.name athlete_unit_name
+                  FROM entries e JOIN athletes a ON a.id=e.athlete_id JOIN units u ON u.id=a.unit_id
+                  WHERE e.id=?`, a.target_id)
+  } else {
+    const r = get(`SELECT r.*, u.name target_unit FROM registrations r JOIN units u ON u.id=r.unit_id WHERE r.id=?`, a.target_id)
+    target = r
+  }
+  const logs = all(`SELECT * FROM appeal_logs WHERE appeal_id=? ORDER BY id`, a.id)
+  return { ...a, impact: safeParseJson(a.impact), unit, sport, target, logs }
+}
+app.get('/api/appeals', (_, res) => {
+  res.json(all('SELECT * FROM appeals ORDER BY id DESC').map(joinAppeal))
+})
+app.post('/api/appeals', (req, res) => {
+  try {
+    const r = submitAppeal(req.body || {})
+    res.json(r)
+  } catch (e) { res.status(400).json({ error: e.message }) }
+})
+app.post('/api/appeals/:id/accept', (req, res) => {
+  try { res.json(acceptAppeal(Number(req.params.id), req.body.reviewer)) }
+  catch (e) { res.status(400).json({ error: e.message }) }
+})
+app.post('/api/appeals/:id/reject', (req, res) => {
+  try { res.json(closeAppeal(Number(req.params.id), 'reject', req.body.note, req.body.reviewer || '组委会')) }
+  catch (e) { res.status(400).json({ error: e.message }) }
+})
+app.post('/api/appeals/:id/withdraw', (req, res) => {
+  try { res.json(closeAppeal(Number(req.params.id), 'withdraw', req.body.note, req.body.operator || '申诉单位')) }
+  catch (e) { res.status(400).json({ error: e.message }) }
+})
+app.post('/api/appeals/:id/uphold', (req, res) => {
+  try {
+    const r = upholdAppeal(Number(req.params.id), req.body || {})
+    res.json(r)
+  } catch (e) { res.status(400).json({ error: e.message }) }
+})
 app.get('/api/quota', (_, res) => {
   const sports = all('SELECT * FROM sports')
   res.json(sports.map(s => {
@@ -1668,6 +2090,12 @@ app.get('/api/overview', (_, res) => {
       JOIN assignments a2 ON a1.referee_id=a2.referee_id AND a1.id<a2.id AND a1.status='assigned' AND a2.status='assigned'
       JOIN matches m1 ON m1.id=a1.match_id JOIN matches m2 ON m2.id=a2.match_id
       WHERE m1.status='scheduled' AND m2.status='scheduled' AND m1.time_label=m2.time_label`)[0]?.c || 0,
+    appeals: {
+      total: get('SELECT COUNT(*) c FROM appeals')?.c || 0,
+      pending: get(`SELECT COUNT(*) c FROM appeals WHERE status='pending'`)?.c || 0,
+      reviewing: get(`SELECT COUNT(*) c FROM appeals WHERE status='reviewing'`)?.c || 0,
+      upheld: get(`SELECT COUNT(*) c FROM appeals WHERE status='upheld'`)?.c || 0
+    },
     sportDone: sp.map(s => ({ ...s, total: mats.filter(m => m.sport_id === s.id).length, done: done.filter(m => m.sport_id === s.id).length })),
     recent: all('SELECT * FROM matches ORDER BY id DESC LIMIT 5').map(joinMatch)
   })
@@ -1710,7 +2138,7 @@ app.post('/api/track/:sportId', (req, res) => {
 app.get('/api/reset', (_, res) => {
   // 单事务重置 + 重置后立即执行历史统计修复，保证演示数据口径一致
   withTransaction(() => {
-    ['assignment_logs', 'assignments', 'registrations', 'entries', 'standings', 'medals', 'matches', 'referees', 'venues', 'athletes', 'teams', 'units', 'sports'].forEach(t => { try { run(`DELETE FROM ${t}`) } catch (e) {} })
+    ['appeal_logs', 'appeals', 'assignment_logs', 'assignments', 'registrations', 'entries', 'standings', 'medals', 'matches', 'referees', 'venues', 'athletes', 'teams', 'units', 'sports'].forEach(t => { try { run(`DELETE FROM ${t}`) } catch (e) {} })
     seed()
     repairHistoricalStats('系统')
   })

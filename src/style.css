@@ -43,6 +43,7 @@ a { color: inherit; }
 .nav button:hover { background: var(--bg2); color: var(--ink); }
 .nav button.active { background: linear-gradient(90deg, #fff3ea, #ffe8d8); color: var(--accent); }
 .nav .em { font-size: 17px; width: 22px; text-align: center; }
+.nav-badge { margin-left: auto; background: var(--accent); color: #fff; font-size: 10px; font-weight: 800; min-width: 18px; height: 18px; line-height: 18px; text-align: center; border-radius: 9px; padding: 0 5px; }
 .side-foot { margin-top: auto; padding: 12px 10px; font-size: 11px; color: var(--muted); line-height: 1.7; background: var(--bg2); border-radius: 12px; }
 .side-foot b { color: var(--accent); }
 .main { flex: 1; padding: 26px 32px 40px; min-width: 0; }

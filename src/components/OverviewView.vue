@@ -8,6 +8,17 @@ const ov = computed(() => store.overview || {})
 const tot = computed(() => store.sports.length)
 const doneTotal = computed(() => ov.value.finishedMatches || 0)
 const prog = computed(() => tot.value ? Math.round((doneTotal.value / Math.max(1, doneTotal.value + (ov.value.pendingMatches || 0))) * 100) : 0)
+
+const appealStatus = { pending: 'o', reviewing: 'b', upheld: 'g', rejected: 'r', withdrawn: 'gray' }
+const appealStatusText = { pending: '待受理', reviewing: '复核中', upheld: '已改判', rejected: '已驳回', withdrawn: '已撤案' }
+const appealList = computed(() => store.appeals.filter(a => ['pending', 'reviewing'].includes(a.status)).slice(0, 4))
+function appealBrief(a) {
+  const t = a.target
+  if (!t) return '（对象已不存在）'
+  if (a.target_type === 'match') return `${t.teamA?.name} ${t.score_a}:${t.score_b} ${t.teamB?.name}`
+  if (a.target_type === 'track') return `${t.aname} ${t.mark}s（第${t.rank}名）`
+  return `「${t.name}」的参赛资格`
+}
 </script>
 
 <template>
@@ -25,6 +36,24 @@ const prog = computed(() => tot.value ? Math.round((doneTotal.value / Math.max(1
       <div class="card stat"><span class="bar" style="background:linear-gradient(90deg,#dd5b5b,#f0a1a1)"></span><span class="ic">⏳</span><b>{{ ov.pendingMatches || 0 }}</b><em>待赛预约</em></div>
       <div class="card stat"><span class="bar" style="background:linear-gradient(90deg,#ffb92b,#ffd98a)"></span><span class="ic">🧑‍⚖️</span><b>{{ ov.crewCoverage ? ov.crewCoverage.slots_filled + '/' + ov.crewCoverage.slots_need : '—' }}</b><em>执法席位覆盖（已完赛+待赛{{ ov.crewCoverage ? '：' + ov.crewCoverage.pct + '%' : '' }}）</em></div>
       <div class="card stat"><span class="bar" style="background:linear-gradient(90deg,#22c15e,#7edda4)"></span><span class="ic">⛳</span><b>{{ prog }}%</b><em>整体完成度</em></div>
+    </div>
+
+    <!-- 申诉复核速览 -->
+    <div class="card mt" v-if="ov.appeals">
+      <div class="caption">⚖️ 赛事申诉复核 <span class="hint">待受理 {{ ov.appeals.pending }} · 复核中 {{ ov.appeals.reviewing }} · 已改判 {{ ov.appeals.upheld }} / 共 {{ ov.appeals.total }} 件</span></div>
+      <div class="pad" style="display:flex;flex-direction:column;gap:10px">
+        <div v-if="!appealList.length" class="empty" style="padding:14px">暂无申诉记录</div>
+        <div v-for="a in appealList" :key="a.id" class="mcard">
+          <div class="mheader">
+            <span><b class="mono" style="color:var(--accent)">{{ a.code }}</b> · {{ a.sport?.name }}</span>
+            <span class="tag" :class="appealStatus[a.status]">{{ appealStatusText[a.status] }}</span>
+          </div>
+          <div class="mrow">
+            <span class="t"><span class="badge"><span class="dot" :style="{ background: store.unitOfUid(a.unit_id)?.color }"></span>{{ a.unit?.name }}</span> 对 <b>{{ appealBrief(a) }}</b> 提出异议</span>
+          </div>
+          <div class="ph" style="font-size:12px;margin-top:2px">💬 {{ a.reason }}</div>
+        </div>
+      </div>
     </div>
 
     <div class="grid g2 mt">

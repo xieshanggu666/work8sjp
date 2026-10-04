@@ -1,5 +1,5 @@
 <script setup>
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import { useEventStore } from '@/store/event'
 import OverviewView from '@/components/OverviewView.vue'
 import ScheduleView from '@/components/ScheduleView.vue'
@@ -10,6 +10,7 @@ import TeamView from '@/components/TeamView.vue'
 import VenueView from '@/components/VenueView.vue'
 import MedalView from '@/components/MedalView.vue'
 import ReportsView from '@/components/ReportsView.vue'
+import AppealView from '@/components/AppealView.vue'
 
 const store = useEventStore()
 store.init()
@@ -17,10 +18,11 @@ store.init()
 const navs = [
   ['overview', '🏟️', '赛事总览'], ['schedule', '🗓️', '赛程编排'], ['score', '⚡', '成绩录入'],
   ['bracket', '🧩', '对阵积分'], ['registration', '📝', '报名审核'], ['team', '👥', '队伍运动员'],
-  ['venue', '📍', '场地裁判'], ['medal', '🥇', '奖牌榜'], ['reports', '📊', '报表中心']
+  ['venue', '📍', '场地裁判'], ['medal', '🥇', '奖牌榜'], ['appeal', '⚖️', '申诉复核'], ['reports', '📊', '报表中心']
 ]
 const view = ref('overview')
-const cur = { overview: OverviewView, schedule: ScheduleView, score: ScoreView, bracket: BracketView, registration: RegistrationView, team: TeamView, venue: VenueView, medal: MedalView, reports: ReportsView }
+const cur = { overview: OverviewView, schedule: ScheduleView, score: ScoreView, bracket: BracketView, registration: RegistrationView, team: TeamView, venue: VenueView, medal: MedalView, appeal: AppealView, reports: ReportsView }
+const pendingAppeals = computed(() => store.appeals.filter(a => a.status === 'pending').length)
 </script>
 
 <template>
@@ -33,6 +35,7 @@ const cur = { overview: OverviewView, schedule: ScheduleView, score: ScoreView, 
       <nav class="nav">
         <button v-for="(n, i) in navs" :key="n[0]" :class="{ active: view === n[0] }" @click="view = n[0]">
           <span class="em">{{ n[1] }}</span>{{ n[2] }}
+          <i v-if="n[0] === 'appeal' && pendingAppeals" class="nav-badge">{{ pendingAppeals }}</i>
         </button>
       </nav>
       <div class="side-foot">

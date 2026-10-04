@@ -17,7 +17,8 @@ export const useEventStore = defineStore('event', {
     sports: [], teams: [], units: [], venues: [], referees: [],
     athletes: [], matches: [], entries: [], medals: [], overview: null,
     standings: {}, registrations: [], quota: [], loaded: false,
-    assignments: [], assignmentLogs: [], conflicts: null, workload: []
+    assignments: [], assignmentLogs: [], conflicts: null, workload: [],
+    appeals: [], appealLogs: []
   }),
   getters: {
     teamOf: s => id => s.teams.find(t => t.id === id),
@@ -28,25 +29,27 @@ export const useEventStore = defineStore('event', {
   },
   actions: {
     async init() {
-      const [sports, teams, units, venues, referees, athletes, matches, entries, medals, overview, registrations, quota, assignments, logs, conflicts, workload] = await Promise.all([
+      const [sports, teams, units, venues, referees, athletes, matches, entries, medals, overview, registrations, quota, assignments, logs, conflicts, workload, appeals, appealLogs] = await Promise.all([
         j('/api/sports'), j('/api/teams'), j('/api/units'), j('/api/venues'), j('/api/referees'),
         j('/api/athletes'), j('/api/matches'), j('/api/entries'), j('/api/medals'), j('/api/overview'),
         j('/api/registrations'), j('/api/quota'),
-        j('/api/assignments'), j('/api/assignment-logs?limit=80'), j('/api/conflicts'), j('/api/referee-workload')
+        j('/api/assignments'), j('/api/assignment-logs?limit=80'), j('/api/conflicts'), j('/api/referee-workload'),
+        j('/api/appeals'), j('/api/appeal-logs?limit=100')
       ])
-      Object.assign(this, { sports, teams, units, venues, referees, athletes, matches, entries, medals, overview, registrations, quota, assignments, assignmentLogs: logs, conflicts, workload })
+      Object.assign(this, { sports, teams, units, venues, referees, athletes, matches, entries, medals, overview, registrations, quota, assignments, assignmentLogs: logs, conflicts, workload, appeals, appealLogs })
       const st = {}
       for (const s of sports) st[s.id] = await j('/api/standings/' + s.id)
       this.standings = st
       this.loaded = true
     },
     async refresh() {
-      const [matches, entries, medals, overview, registrations, quota, teams, athletes, assignments, logs, conflicts, workload, referees] = await Promise.all([
+      const [matches, entries, medals, overview, registrations, quota, teams, athletes, assignments, logs, conflicts, workload, referees, appeals, appealLogs] = await Promise.all([
         j('/api/matches'), j('/api/entries'), j('/api/medals'), j('/api/overview'),
         j('/api/registrations'), j('/api/quota'), j('/api/teams'), j('/api/athletes'),
-        j('/api/assignments'), j('/api/assignment-logs?limit=80'), j('/api/conflicts'), j('/api/referee-workload'), j('/api/referees')
+        j('/api/assignments'), j('/api/assignment-logs?limit=80'), j('/api/conflicts'), j('/api/referee-workload'), j('/api/referees'),
+        j('/api/appeals'), j('/api/appeal-logs?limit=100')
       ])
-      Object.assign(this, { matches, entries, medals, overview, registrations, quota, teams, athletes, assignments, assignmentLogs: logs, conflicts, workload, referees })
+      Object.assign(this, { matches, entries, medals, overview, registrations, quota, teams, athletes, assignments, assignmentLogs: logs, conflicts, workload, referees, appeals, appealLogs })
       const st = {}
       for (const s of this.sports) st[s.id] = await j('/api/standings/' + s.id)
       this.standings = st
@@ -71,6 +74,10 @@ export const useEventStore = defineStore('event', {
     async reassignAssignment(id, payload) { const r = await j('/api/assignments/' + id + '/reassign', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }); await this.refresh(); return r },
     async changeSchedule(id, payload) { const r = await j('/api/matches/' + id + '/schedule', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }); await this.refresh(); return r },
     async addReferee(payload) { const r = await j('/api/referees', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }); if (r.error) throw new Error(r.error); await this.refresh(); return r },
+    // —— 赛事申诉复核 ——
+    async submitAppeal(payload) { const r = await j('/api/appeals', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }); await this.refresh(); return r },
+    async withdrawAppeal(id, payload) { const r = await j('/api/appeals/' + id + '/withdraw', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }); await this.refresh(); return r },
+    async reviewAppeal(id, payload) { const r = await j('/api/appeals/' + id + '/review', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }); await this.refresh(); return r },
     async reset() { await j('/api/reset'); await this.init() }
   }
 })

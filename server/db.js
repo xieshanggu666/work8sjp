@@ -137,6 +137,42 @@ CREATE TABLE IF NOT EXISTS assignment_logs (
   created_at TEXT DEFAULT (datetime('now','localtime'))
 );
 CREATE INDEX IF NOT EXISTS idx_logs_match ON assignment_logs(match_id);
+
+-- 赛事申诉复核（参赛单位异议 → 组委会复核 → 回写比分/成绩/资格 → 级联递补与重算）
+CREATE TABLE IF NOT EXISTS appeals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL,             -- 申诉单号 SS-YYYYMMDD-序号
+  target_type TEXT NOT NULL,      -- match(比分赛果) / track(田径成绩) / eligibility(参赛资格)
+  target_kind TEXT,               -- eligibility 时区分 team / athlete
+  target_id INTEGER NOT NULL,     -- matches.id / athletes.id / teams|athletes.id
+  sport_id INTEGER,
+  unit_id INTEGER NOT NULL,       -- 提起异议的参赛单位
+  reason TEXT NOT NULL,           -- 异议内容
+  evidence TEXT,                  -- 证据说明（录像/统计表/证人等）
+  status TEXT NOT NULL DEFAULT 'pending',  -- pending(待复核) / upheld(成立) / rejected(驳回) / withdrawn(已撤申)
+  correction TEXT,                -- 复核改判快照 JSON（前后比分/成绩、级联影响、积分与奖牌前后全量）
+  review_note TEXT,               -- 组委会复核意见（必填，留痕）
+  reviewer TEXT,
+  submitted_at TEXT DEFAULT (datetime('now','localtime')),
+  reviewed_at TEXT,
+  withdrawn_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_appeals_status ON appeals(status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_appeals_pending_target
+  ON appeals(target_type, target_id) WHERE status='pending';
+-- 申诉复核全量审计：提交/撤申/驳回/改判/成绩更正/撤销资格/恢复资格逐笔留痕
+CREATE TABLE IF NOT EXISTS appeal_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  appeal_id INTEGER,
+  action TEXT NOT NULL,   -- submit/withdraw/reject/amend_match/amend_track/revoke_eligibility/restore_eligibility
+  target_type TEXT,
+  target_id INTEGER,
+  detail TEXT,            -- 人类可读快照（对象/变更前后/级联规模）
+  reason TEXT,
+  operator TEXT,
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_appeal_logs_appeal ON appeal_logs(appeal_id);
 `)
 
 // —— 旧库迁移：补充字段（列已存在则忽略） ——

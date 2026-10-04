@@ -87,6 +87,8 @@ async function saveTrack(sid) {
   setTimeout(() => toast.value = '', 3000)
 }
 const rankCls = r => r === 1 ? '#d99a00' : r === 2 ? '#90a4ae' : r === 3 ? '#c9743a' : 'var(--muted)'
+// 场次最新一条申诉（任意状态），用于成绩录入页提示该场存在异议 / 已改判
+const appealOf = mid => store.appeals.find(a => a.target_type === 'match' && a.target_id === mid)
 </script>
 
 <template>
@@ -104,7 +106,12 @@ const rankCls = r => r === 1 ? '#d99a00' : r === 2 ? '#90a4ae' : r === 3 ? '#c97
       <div v-for="m in matches" :key="m.id" class="mcard" :class="{ done: m.status==='finished' }">
         <div class="mheader">
           <span>{{ store.sports.find(x=>x.id===m.sport_id)?.name }} · {{ m.stage }}{{ m.group_name ? ' · ' + m.group_name : '' }}</span>
-          <span class="tag" :class="m.status==='finished' ? 'g' : m.status==='void' ? 'r' : 'o'">{{ m.status==='finished' ? '已完赛' : m.status==='void' ? '已取消' : '待赛' }}</span>
+          <span class="row" style="gap:4px">
+            <span v-if="appealOf(m.id)" class="tag" :class="appealOf(m.id).status === 'upheld' ? 'g' : appealOf(m.id).status === 'rejected' ? 'r' : 'o'">
+              ⚖️ {{ appealOf(m.id).status === 'upheld' ? '申诉已改判' : appealOf(m.id).status === 'rejected' ? '申诉已驳回' : appealOf(m.id).status === 'withdrawn' ? '已撤申' : '被申诉' }}
+            </span>
+            <span class="tag" :class="m.status==='finished' ? 'g' : m.status==='void' ? 'r' : 'o'">{{ m.status==='finished' ? '已完赛' : m.status==='void' ? '已取消' : '待赛' }}</span>
+          </span>
         </div>
         <div class="mrow">
           <span class="t"><span class="badge"><span class="dot" :style="{ background: store.unitOfUid(m.teamA?.unit_id)?.color }"></span>{{ m.teamA?.name }}</span></span>
